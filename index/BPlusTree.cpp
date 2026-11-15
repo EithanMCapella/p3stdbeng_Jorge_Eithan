@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
+#include "heapfile/SlottedPage.h"
 
 namespace bptree {
 
@@ -609,11 +610,40 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
     // (routing_child_index), release the pin, and recurse into that
     // child with levels_remaining - 1. An empty tree (kNoPage) also
     // returns kNoPage.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)error;
-    return idx::kNoPage;
+
+    error.clear();
+    if (block == idx::kNoPage) {
+        return idx::kNoPage;
+    }
+
+    // Base case: we are at the leaf, return block
+    if (levels_remaining == 1) {
+        return block;
+    }
+
+    BptSeparatorPage page;
+    std::size_t frame = 0;
+    if (!pin_separator(block, page, frame, error)) {
+        return idx::kNoPage;
+    }
+
+    // It does slide 24 if/else chain
+    // routing_child_index returns a child position in 0..count(); the caller resolves it to a
+    // block id (first_child, or child(position - 1)).
+    std::size_t i = page.routing_child_index(key_bytes.data(), codec_);
+
+    std::uint32_t child;
+    if (i == 0) {
+        child = page.first_child();
+    }
+    else {
+        child = page.child(i - 1);
+    }
+
+    // release before recursion
+    release(manager_, frame, false);
+
+    return tree_search(child, levels_remaining - 1, key_bytes, error);
 }
 // BPlusTree::run_start — the equal-key run's leftmost leaf: walks left
 // from the landing leaf while the previous leaf's LAST key EQUALS the
@@ -1613,13 +1643,130 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
     // minimum upward. At a leaf: order, every rid judged through
     // occupied (dangling findings), walked += count, depth range
     // updated, and the subtree minimum reported (nullopt when empty).
-    (void)block;
-    (void)depth;
-    (void)is_root;
-    (void)walk;
-    (void)error;
-    (void)subtree_min;
-    return false;
+
+    // Notes: Findings is filled with all the problems we find in the tree
+    // verify() is the wrapper, if its empty the tree is healthy
+
+
+
+    // Set up
+    error.clear();
+    if (subtree_min != nullptr) {
+        *subtree_min = std::nullopt;
+    }
+
+    // when block is bigger than walk seen size, it is pointing to a block that doesn't exist.
+    // if the seen block is not 0 then we have been here already
+    // if the seen block is 1 then it is marked.
+    // verify will check seen, if any block is sitll 0 it is reachable from nowhere
+    if (block >= walk.seen.size()) {
+        walk.findings.push_back(  std::to_string(block) +" block is beyond the file");
+        return true;
+    }
+
+    if (walk.seen[block] != 0) {
+        walk.findings.push_back(std::to_string(block) + " block is reachable twice");
+        return true;
+    }
+    walk.seen[block] = 1;
+
+    // Separator page
+    if (depth < levels_) {
+        BptSeparatorPage page;
+        std::size_t frame = 0;
+
+        // pin the separator, to use.
+        if (!pin_separator(block, page, frame, error)) {
+            return false;
+        }
+
+        const std::size_t n = page.count();
+        const std::uint32_t first = page.first_child();
+        std::vector<idx::IndexEntry> pairs;
+
+        for (std::size_t i = 0; i < n; ++i) {
+            pairs.push_back(page.entry(i));
+        }
+        release(manager_, frame, false);
+
+        // Check Occupancy
+        // Slide 21 leaf and internal nodes have m keys
+        // order d has property d <= m <= 2d
+        // separator cap returns the pair capacity; always at least 2d with d = capacity / 2.
+        if (!is_root && (n < min_separator_keys() || n > max_separator_keys())) {
+            walk.findings.push_back("separator page " + std::to_string(block) + " holds " +
+                        std::to_string(n) + " keys outside the rule");
+        }
+
+        for (std::size_t i = 1; i < n; ++i) {
+            if (codec_.compare(pairs[i-1].key.data(), pairs[i].key.data()) >= 0) {
+                walk.findings.push_back("separator page " + std::to_string(block) +
+                    " is out of order at key " + std::to_string(i));
+            }
+        }
+
+        // Recursion, Ref Slide 24 but for every child
+        std::optional<std::string> child_min;
+        if (!verify_rec(first, depth + 1, false, walk, error, &child_min) ) {
+            return false;
+        }
+        if (subtree_min != nullptr) {
+            *subtree_min = child_min;
+        }
+
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!verify_rec(pairs[i].child, depth + 1, false, walk, error, &child_min)) {
+                return false;
+            }
+            if (!child_min || codec_.compare(child_min->data(), pairs[i].key.data()) != 0) {
+                walk.findings.push_back("separator " + codec_.display(pairs[i].key.data()) +
+                    " inside page " + std::to_string(block) + " != its child's 1st key");
+            }
+        }
+        return true;
+    }   // end of the separator branch: everything below handles a leaf
+
+    // Leaf page
+    BptLeafPage leaf;
+    std::size_t frame = 0;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+    const std::size_t n = leaf.count();
+    if (!is_root && (n < min_leaf_entries() || n > max_leaf_entries())) {
+        walk.findings.push_back("leaf " + std::to_string(block) + " contains " +
+            std::to_string(n) + " entries outside the order rule");
+    }
+
+    // per entry: only the order and dangling checks
+    for (std::size_t i = 0; i < n; ++i) {
+        const idx::DataEntry entry = leaf.get_entry(i);
+        if (i > 0 && codec_.compare(leaf.get_entry(i - 1).key.data(), entry.key.data()) > 0) {
+            walk.findings.push_back("leaf " + std::to_string(block) + " is out of order at entry "
+            + std::to_string(i));
+        }
+        if (!walk.occupied(entry.rid)) {
+            walk.findings.push_back("dangling entry of key " + codec_.display(entry.key.data())
+                + " rid: " + std::to_string(entry.rid.page_id) + "," + std::to_string(entry.rid.slot));
+        }
+    }
+
+    // once per leaf
+    walk.walked += n;
+    if (walk.min_depth == 0) {
+        walk.min_depth = depth;
+        walk.max_depth = depth;
+    }
+    else {
+        walk.min_depth = std::min(walk.min_depth, depth);
+        walk.max_depth = std::max(walk.max_depth, depth);
+    }
+
+    if (subtree_min != nullptr && n > 0) {
+        *subtree_min = leaf.get_entry(0).key;
+    }
+    release(manager_, frame, false);
+    return true;
 }
 
 }
