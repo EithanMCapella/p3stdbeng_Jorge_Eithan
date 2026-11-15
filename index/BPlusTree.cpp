@@ -707,7 +707,7 @@ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
         // does prev leaf end with target key
         BptLeafPage prev_leaf;
         std::size_t prev_frame = 0;
-        if (!pin_leaf(prev, prev_leaf, frame, error)) {
+        if (!pin_leaf(prev, prev_leaf, prev_frame, error)) {
             return idx::kNoPage;
         }
 
@@ -716,9 +716,9 @@ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
         // if it has elements
         if (n > 0) {
             const std::string last_key = prev_leaf.get_entry(n - 1).key;
-            equal = codec_.compare(last_key.data(), key_bytes.data()) == 0; // compare agaisnt target
+            equal = codec_.compare(last_key.data(), key_bytes.data()) == 0; // compare against target
         }
-        release(manager_, frame, false);
+        release(manager_, prev_frame, false);
 
         // if equality fails exit and return the current
         if (!equal) {
@@ -751,11 +751,55 @@ bool BPlusTree::gather_run(const std::string& key_bytes, std::uint32_t start,
     // Scans left to right, run_start gathers the leftmost one, so we start from it
     // moving through each (next_leaf_ as the key equals the target.
 
-    (void)key_bytes;
-    (void)start;
-    (void)out;
-    (void)error;
-    return false;
+    // Similar to the run above
+
+    error.clear();
+    if (start == idx::kNoPage) {
+        return true;
+    }
+
+    //Grab the current leaf page
+    std::uint32_t current = start;
+    while (current != idx::kNoPage) {
+        BptLeafPage leaf;
+        std::size_t frame = 0;
+        if (!pin_leaf(current, leaf, frame, error)) {
+            return false;
+        }
+        // find the position of target and skip any unneeded keys
+        std::size_t i = leaf.lower_bound(key_bytes.data(), codec_);
+        // scan forward as long as keys are equal to the target
+        while (i < leaf.count() && codec_.compare(leaf.get_entry(i).key.data(), key_bytes.data()) == 0) {
+            out.push_back(leaf.get_entry(i).rid); // append them to out
+            i++;
+        }
+        //finished this leaf, check if we need to hop to the next one
+
+        // we only hop if leaf's last key equals target
+        bool equal = false;
+        // [20,21,21] when target is 21 we hop
+        // if [20,21,23] we don't need to hop the next leaf will always be bigger.
+        const std::size_t n = leaf.count();
+        // if it has elements grab the last entry and check if equals target
+        if (n > 0) {
+            const std::string last_key = leaf.get_entry(n - 1).key;
+            equal = codec_.compare(last_key.data(), key_bytes.data()) == 0; // compare against target
+        }
+        const std::uint32_t next = leaf.next_leaf();
+        // BptLeafPage next_leaf;
+        // std::size_t next_frame = 0;
+        // if (!pin_leaf(next, next_leaf, next_frame, error)) {
+        //     return false;
+        // }
+        release(manager_, frame, false);
+
+        // if lastkey differs stop run
+        if ( !equal ) {
+            break;
+        }
+        current = next;
+    }
+    return true;
 }
 // BPlusTree::locate_in_run — finds the exact (key, rid) entry within
 // the equal-key run: the leaves are scanned for the pair, so the erase
