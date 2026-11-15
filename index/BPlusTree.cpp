@@ -1191,12 +1191,77 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
     // (equal keys go RIGHT — where the routing sends their duplicates).
     // Fill `split` with the copied-up separator (the new leaf's smallest
     // key) and the new block.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+
+    split = Split{};
+    const idx::DataEntry arriving{key_bytes, rid};
+
+    std::size_t frame = 0;
+    BptLeafPage leaf;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+
+    // Base case, compare ir with 2d, if space available insert entry
+    if (leaf.count() < max_leaf_entries()) {
+        const bool ok = leaf.insert_entry(arriving, codec_, error);
+        release(manager_, frame, ok);
+        return ok;
+    }
+
+    // Full leaf, split.
+    const std::uint32_t old_next = leaf.next_leaf();
+
+    std::uint32_t new_block = idx::kNoPage;
+    std::size_t new_frame = 0;
+    if (!alloc_next_block(new_block, new_frame, error))
+    {
+        release(manager_, frame, false);
+        return false;
+    }
+
+    // A recycled block holds old data, so format the fresh page.
+    // Its chain links: prev = this leaf, next = this leaf's old neighbour.
+    BptLeafPage fresh;
+    fresh.bind(manager_.frame(new_frame).buffer, codec_.width());
+    fresh.format(block, old_next);
+
+    // This page keeps its first d entries; the other d move right.
+    leaf.move_tail_to(min_leaf_entries(), fresh, codec_.width());
+    leaf.set_next_leaf(new_block);
+
+    // The old right neighbour must now point back at the new leaf.
+    if (old_next != idx::kNoPage)
+    {
+        std::size_t neighbour_frame = 0;
+        BptLeafPage neighbour;
+        if (!pin_leaf(old_next, neighbour, neighbour_frame, error))
+        {
+            release(manager_, new_frame, true);
+            release(manager_, frame, true);
+            return false;
+        }
+        neighbour.set_prev_leaf(new_block);
+        release(manager_, neighbour_frame, true);
+    }
+
+    // Place the arriving entry. Equal keys go RIGHT, because the routing
+    // rule (Ki <= key goes right) will send future searches for it there.
+    const std::string right_first = fresh.get_entry(0).key;
+    const bool goes_right =
+        codec_.compare(key_bytes.data(), right_first.data()) >= 0;
+    const bool ok = goes_right ? fresh.insert_entry(arriving, codec_, error)
+                               : leaf.insert_entry(arriving, codec_, error);
+
+    if (ok)
+    {
+        // Copy up (not move up): the new leaf's smallest key stays in the
+        // leaf AND becomes the parent's separator.
+        split.separator_key = fresh.get_entry(0).key;
+        split.new_block = new_block;
+    }
+    release(manager_, new_frame, true);
+    release(manager_, frame, true);
+    return ok;
 }
 
 // --- the recursion contract: erase ----------------------------------------------
