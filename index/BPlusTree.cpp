@@ -1075,14 +1075,92 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     // its child becomes the new page's first child
     // (move_tail_to(middle + 1)), filling `split` for the parent. The
     // wrapper turns a root split into a new root.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+    
+    // Note that the child passes to its parent. Empty == Nothing happened
+    // Filled == I splitted, here's my new right sibling (new block) and the key
+    // that routes to it (separator key).
+    split = Split{};
+
+    // Base case, levels_remaining == 1 means this block IS the leaf.
+    if (levels_remaining <= 1) {
+        return insert_leaf(block, key_bytes, rid, split, error);
+    }
+
+    // Route (slide 36): the child after the last separator <= key. Stepper. 
+    // Turning the position into a block number.
+    std::size_t frame = 0;
+    BptSeparatorPage page;
+    if (!pin_separator(block, page, frame, error)) {
+        return false;
+    }
+    const std::size_t pos = page.routing_child_index(key_bytes.data(), codec_);
+    const std::uint32_t child = pos == 0 ? page.first_child() : page.child(pos - 1);
+    release(manager_, frame, false); // release before recursion
+
+    // Recurse, the child reports whether it split. If empty return
+    Split child_split;
+    if (!insert_aux(child, levels_remaining - 1, key_bytes, rid, child_split, error)) {
+        return false;
+    }
+
+    // Child split, its new right sibling must hang right after it
+    const idx::IndexEntry new_pair{child_split.separator_key, child_split.new_block};
+    if (!pin_separator(block, page, frame, error)) {
+        return false;
+    }
+    if (page.count() < max_separator_keys()) {
+        const bool ok = page.insert_pair_after(pos, new_pair, error);
+        release(manager_, frame, ok);
+        return ok;
+    }
+
+    // This page is full, split it
+    std::vector<idx::IndexEntry> pairs;
+    pairs.reserve(page.count() + 1);
+    for (std::size_t i = 0; i < page.count(); ++i) {
+        pairs.push_back(page.entry(i)); // Copies it into the vector, not the pointers
+    }
+    pairs.insert(pairs.begin() + static_cast<std::ptrdiff_t>(pos), new_pair);
+    const std::uint32_t first = page.first_child(); // First ones stays in the same block
+
+    const std::size_t d = min_separator_keys();
+    const idx::IndexEntry middle = pairs[d]; // This key moves up
+
+    std::uint32_t new_block = idx::kNoPage;
+    std::size_t new_frame = 0;
+    if (!alloc_next_block(new_block, new_frame, error)) {
+        release(manager_, frame, false);
+    }
+
+    // Right half, the middle pair's child becomes its first child (P0), 
+    // Then pairs d+1 .. 2d, its subtree minimum is middle.key, so the separator 
+    // so the separator we push stais exact
+    BptSeparatorPage right;
+    right.bind(manager_.frame(new_frame).buffer, codec_.width());
+    right.format();
+    right.set_first_child(middle.child);
+    bool ok = true;
+    for (std::size_t i = d + 1; i < pairs.size() && ok; ++i) {
+        ok = right.append(pairs[i], error);
+    }
+
+    // Left half (this page) same first child, pairs 0 .. d-1 (d pairs).
+    page.format();
+    page.set_first_child(first);
+    for (std::size_t i = 0; i < d && ok; ++i) {
+        ok = page.append(pairs[i], error);
+    }
+
+    release(manager_, new_frame, true);
+    release(manager_, frame, true);
+    if (!ok) {
+        return false;
+    }
+    split.separator_key = middle.key; // in NEITHER half: it was moved up
+    split.new_block = new_block;
+    return true;
 }
+
 // BPlusTree::insert_leaf — the leaf phase of insert_aux: room within
 // 2d means a plain sorted insert; a full leaf (2d entries) splits per
 // slide 35 — this page keeps d, the new leaf takes d+1, the separator
