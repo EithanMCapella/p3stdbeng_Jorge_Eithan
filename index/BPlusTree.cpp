@@ -1141,6 +1141,12 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
         return false;
     }
 
+    // without this failed: PASS: 800 random inserts keep the tree clean and balanced
+    // check if child split, no need to continue if child is fine.
+    if (child_split.new_block == idx::kNoPage) {
+        return true; //child had space
+    }
+
     // Child split, its new right sibling must hang right after it
     const idx::IndexEntry new_pair{child_split.separator_key, child_split.new_block};
     if (!pin_separator(block, page, frame, error)) {
@@ -1168,6 +1174,7 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     std::size_t new_frame = 0;
     if (!alloc_next_block(new_block, new_frame, error)) {
         release(manager_, frame, false);
+        return false;
     }
 
     // Right half, the middle pair's child becomes its first child (P0), 
@@ -1430,13 +1437,64 @@ bool BPlusTree::erase_rec(std::uint32_t block, std::uint32_t levels_remaining,
     // child (set_separator_key) — or propagate the change upward when
     // the child is the first child. Fill `up` with this page's own
     // post-repair state.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+
+    error.clear();
+    up = EraseUp{};
+
+    // Reference insert_aux
+    if (levels_remaining <= 1) {
+        return erase_leaf(block, key_bytes, rid, up, error);
+    }
+
+    BptSeparatorPage page;
+    std::size_t frame = 0;
+    if (!pin_separator(block, page, frame, error)) {
+        return false;
+    }
+    const std::size_t pos = page.routing_child_index(key_bytes.data(), codec_);
+    const std::uint32_t child = pos == 0 ? page.first_child() : page.child(pos -1);
+    release(manager_, frame, false);
+
+    // Recursive
+    EraseUp child_up;
+    if (!erase_rec(child, levels_remaining -1, key_bytes, rid, child_up, error)) {
+        return false;
+    }
+
+    // smallest key changed
+    if (child_up.first_changed) {
+        if (pos > 0) {
+
+            if (!pin_separator(block, page, frame, error)) {
+                return false;
+            }
+            page.set_separator_key(pos - 1, child_up.new_first.data());
+            release(manager_, frame, true);
+        }
+    else {
+        up.first_changed = true;
+        up.new_first = child_up.new_first;
+        }
+    }
+    // if the child fell below d
+    // two choices check if neighbor has data to spare
+    // or merge if there are none
+
+    //if I understand properly erase_leaf tells the parent this through up
+    // leaf.count() < min_leaf_entries() If we have less keys than the minimum
+    if (child_up.underflow) { // if its too small
+        EraseUp repair;
+        if (!fix_child_underflow(block, levels_remaining, pos, repair, error)) {
+            return false;
+        }
+        up.underflow = repair.underflow;
+
+        if (repair.first_changed) {
+            up.first_changed = true;
+            up.new_first = repair.new_first;
+        }
+    }
+    return true;
 }
 // BPlusTree::erase_leaf — the leaf phase of erase_rec: find the exact
 // (key, rid) entry in this leaf's equal-key run, erase it (the
@@ -1462,12 +1520,53 @@ bool BPlusTree::erase_leaf(std::uint32_t block, const std::string& key_bytes,
     // fill `up`: underflow when count < min_leaf_entries(); when the
     // erased entry was the first, report whether the first key moved
     // (up.first_changed + up.new_first); an emptied leaf reports both.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+    error.clear();
+    up = EraseUp{};
+
+    BptLeafPage leaf;
+    std::size_t frame = 0;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+
+    // Scan just like we did in locate_in_run, find the matching key and rid
+    std::size_t i = leaf.lower_bound(key_bytes.data(), codec_);
+    bool found = false;
+    while (i < leaf.count() && codec_.compare(leaf.get_entry(i).key.data(), key_bytes.data()) == 0) {
+        if (leaf.get_entry(i).rid == rid) {
+            found = true;
+            break; //found, erase i
+        }
+        i++;
+    }
+    // Went through whole list not found
+    if (!found) {
+        release(manager_, frame, false);
+        error = "no index for key " + codec_.display(key_bytes.data()) +
+                " and rid " + std::to_string(rid.page_id) + "," +
+                std::to_string(rid.slot);
+        return false;
+    }
+
+    // If we are here we found it, now erase it
+    const bool was_first = (i == 0);
+    if (!leaf.erase_entry(i, error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+
+    // up serves as a carrier we need to report the state so the other functions se it
+    up.underflow = leaf.count() < min_leaf_entries(); // smaller than d
+    // calls fix_child_underflow
+
+    // Smallest key was changed, report the new child
+    if (was_first && leaf.count() > 0) {
+        up.first_changed = true; //mark the leaf minimum as changed
+        up.new_first = leaf.get_entry(0).key; //report who
+    }
+
+    release(manager_, frame, true);
+    return true;
 }
 // BPlusTree::fix_child_underflow — repairs a child holding fewer than d
 // entries: redistribute with a sibling that can lend (left preferred,
@@ -1497,6 +1596,11 @@ bool BPlusTree::fix_child_underflow(std::uint32_t block,
     // can lend (left preferred, then right — borrow_from_left /
     // borrow_from_right); otherwise merge_child. Fill `up` with this
     // page's own underflow state afterwards (a merge dropped one pair).
+
+    // So redistribute preferring left, check if left sibling has more than d?
+    // if not check right sibling, does it have more than d?
+    // if both of these fail merge_child
+
     (void)block;
     (void)levels_remaining;
     (void)child_index;
