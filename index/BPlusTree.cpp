@@ -1601,6 +1601,19 @@ bool BPlusTree::fix_child_underflow(std::uint32_t block,
     // if not check right sibling, does it have more than d?
     // if both of these fail merge_child
 
+    // we need to identify whether it is a leaf or not
+    // leaf: level_remaining is 1
+    // separator: level_remaining is 2 or above
+
+    // we need to find the neighbors as well
+    // child left and right so - 1 & + 1
+
+    // if left is not kNoPage  && quick_count() > d
+    //      borrow_from_left
+    // if right ...
+    //      borrow_from_right
+    // else  just merge_child
+
     (void)block;
     (void)levels_remaining;
     (void)child_index;
